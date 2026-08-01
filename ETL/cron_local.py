@@ -5,16 +5,17 @@ import requests
 import pandas as pd
 from sqlalchemy import create_engine, text
 from datetime import datetime
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # ==========================================
 # CONFIGURACIÓN DE BASE DE DATOS
 # ==========================================
 # ATENCIÓN: Por seguridad, es mejor usar variables de entorno en lugar de contraseñas en texto plano.
-# He configurado esto para que lea la variable DATABASE_URL, y si no existe, use la que me proporcionaste.
-DB_URL = os.environ.get(
-    "DATABASE_URL", 
-    "postgresql://neondb_owner:npg_70axEuKiXsWN@ep-falling-voice-ay298gyd.c-5.us-east-2.aws.neon.tech/neondb?sslmode=require&channel_binding=require"
-)
+DB_URL = os.environ.get("DATABASE_URL")
+if not DB_URL:
+    raise ValueError("Falta configurar DATABASE_URL en el archivo .env")
 
 # SQLAlchemy a veces requiere que el prefijo sea postgresql:// y no postgres://
 if DB_URL.startswith("postgres://"):
