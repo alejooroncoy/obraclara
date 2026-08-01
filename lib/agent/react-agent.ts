@@ -39,45 +39,63 @@ type AgentStep = ToolCall | FinalAnswer;
 // System prompt del agente
 // ─────────────────────────────────────────────────────────────
 
-const SYSTEM_PROMPT = `Eres Vigía Público, asistente especializado en obras públicas del Perú (base de datos INFOBRAS, Contraloría General de la República).
+const SYSTEM_PROMPT = `Eres Vigía Público, un asistente especializado en obras públicas del Perú.
+Tienes acceso a la base de datos INFOBRAS de la Contraloría General de la República.
 
-REGLA ABSOLUTA: Tu respuesta debe ser ÚNICAMENTE un objeto JSON válido. NADA antes. NADA después. Sin markdown, sin backticks, sin razonamiento, sin explicaciones previas.
+Siempre respondes en JSON válido (sin markdown, sin backticks). El JSON debe tener UNO de estos formatos:
 
-El JSON debe tener exactamente UNO de estos dos formatos:
+Formato A — usar herramienta:
+{
+  "action": "tool_call",
+  "thought": "razonamiento breve de por qué usas esta herramienta",
+  "tool": "<nombre_exacto_de_herramienta>",
+  "args": { ... }
+}
 
-Formato A — invocar herramienta:
-{"action":"tool_call","tool":"<nombre>","args":{...}}
+Formato B — respuesta final:
+{
+  "action": "final_answer",
+  "answer": "texto de respuesta al usuario en español claro"
+}
 
-Formato B — respuesta final al usuario:
-{"action":"final_answer","answer":"<texto en español>"}
+HERRAMIENTAS DISPONIBLES:
 
-HERRAMIENTAS:
+1. buscar_obras
+   Busca obras en la BD filtrando por cualquier combinación de campos.
+   Args opcionales (incluye solo los que el usuario mencionó):
+   - nombre: string — fragmento del nombre de la obra
+   - codigo: string — código INFOBRAS exacto
+   - distrito: string — nombre del distrito
+   - estado: string — "En Ejecución" | "Paralizada" | "Finalizada"
+   - contratista: string — nombre o fragmento del contratista
+   Retorna: { total_encontrado, truncado, obras: [...] }
 
-1. buscar_obras — filtra obras por cualquier combinación de:
-   nombre (texto), codigo (código INFOBRAS), distrito, estado ("En Ejecución"|"Paralizada"|"Finalizada"), contratista
-   → Devuelve: {total_encontrado, truncado, obras:[...]}
+2. buscar_por_direccion
+   Busca obras cuya dirección se parezca a la indicada (fuzzy matching).
+   Args:
+   - direccion: string — REQUERIDO — dirección o referencia escrita por el usuario
+   - distrito: string — OPCIONAL — para acotar la búsqueda
+   Retorna: candidatos con score_similitud (0-100). Si score < 70, avisa al usuario que la coincidencia es aproximada.
 
-2. buscar_por_direccion — fuzzy matching sobre el campo dirección:
-   args: {"direccion":"...","distrito":"..."(opcional)}
-   → Devuelve candidatos con score_similitud 0-100. Si score<70 avisa al usuario.
+3. obtener_detalle_obra
+   Retorna todos los datos de una obra por su código INFOBRAS.
+   Args:
+   - codigo: string — REQUERIDO — código INFOBRAS exacto
+   Retorna: detalle completo (contratista, monto, fechas, avance, paralizaciones, etc.)
 
-3. obtener_detalle_obra — datos completos de una obra:
-   args: {"codigo":"<código INFOBRAS exacto>"}
-   → Devuelve: contratista, montos, fechas, avance físico, paralizaciones, etc.
+4. obtener_historial_contratista
+   Retorna todas las obras de un contratista + score de confianza calculado automáticamente.
+   Args:
+   - contratista: string — REQUERIDO — nombre o fragmento del contratista
+   Retorna: { total_obras, finalizadas, paralizadas, score_confianza (0-100), etiqueta_confianza, obras }
 
-4. obtener_historial_contratista — todas las obras + score de confianza (ya calculado, no lo calcules tú):
-   args: {"contratista":"<nombre o fragmento>"}
-   → Devuelve: {total_obras, finalizadas, paralizadas, score_confianza, etiqueta_confianza, obras:[...]}
-
-REGLAS DE NEGOCIO:
-- Nunca calcules el score de confianza tú mismo; ya viene en el resultado.
-- "LIMA" es una región/provincia, no un distrito. Busca sin filtrar por distrito si el usuario dice solo "Lima".
-- Si no hay datos, indícalo sin inventar información.
-- Responde siempre en español claro y ciudadano.
-- Si necesitas múltiples herramientas, úsalas en turnos: primero busca, luego detalla.
-
-Recuerda: SOLO JSON. Nada más.`;
-
+REGLAS:
+- Nunca calcules tú el score de confianza; ya viene calculado en el resultado de la herramienta.
+- Si el usuario busca por dirección y los scores son < 70, menciona que la coincidencia es aproximada.
+- Si no hay datos en la BD, indícalo claramente sin inventar información.
+- No atribuyas responsabilidades ni hagas juicios. Cita los datos tal como están.
+- Responde siempre en español, de forma concisa y ciudadana.
+- Si necesitas múltiples herramientas, úsalas en turnos separados (primero buscar, luego detallar).`;
 
 // ─────────────────────────────────────────────────────────────
 // Cliente Gemma — llamada directa (reutiliza la misma API key/endpoint)
@@ -163,59 +181,19 @@ async function callGemma(messages: Array<{ role: "user" | "model"; text: string 
 // Parser del JSON devuelto por Gemma
 // ─────────────────────────────────────────────────────────────
 
-/**
- * Extrae el primer objeto JSON válido con campo "action" de un texto que
- * puede contener razonamiento libre antes/después del JSON.
- * Gemma a veces "piensa en voz alta" antes de emitir el JSON.
- */
-function extractJsonFromText(raw: string): string | null {
-  // 1. Buscar fence de código ```json ... ```
-  const fenceMatch = raw.match(/```(?:json)?\s*([\s\S]*?)```/);
-  if (fenceMatch?.[1]) return fenceMatch[1].trim();
-
-  // 2. Buscar todos los bloques {...} y devolver el primero que tenga "action"
-  let depth = 0;
-  let start = -1;
-  for (let i = 0; i < raw.length; i++) {
-    if (raw[i] === "{") {
-      if (depth === 0) start = i;
-      depth++;
-    } else if (raw[i] === "}") {
-      depth--;
-      if (depth === 0 && start !== -1) {
-        const candidate = raw.slice(start, i + 1);
-        try {
-          const parsed = JSON.parse(candidate) as Record<string, unknown>;
-          // Solo aceptar si tiene el campo "action"
-          if (typeof parsed.action === "string") return candidate;
-        } catch {
-          // No era JSON válido, seguir buscando
-        }
-        start = -1;
-      }
-    }
-  }
-  return null;
-}
-
 function parseAgentStep(raw: string): AgentStep {
-  const jsonStr = extractJsonFromText(raw);
-
-  // Si no encontramos JSON estructurado, tratar la respuesta completa como respuesta final
-  if (!jsonStr) {
-    // Limpiar el texto de backticks y prefijos de razonamiento comunes
-    const cleaned = raw
-      .trim()
-      .replace(/^```(?:json)?\s*/i, "")
-      .replace(/\s*```$/i, "");
-    return { action: "final_answer", answer: cleaned.slice(0, 3000) };
-  }
+  // Eliminamos posibles fences de markdown que Gemma a veces agrega
+  const cleaned = raw
+    .trim()
+    .replace(/^```(?:json)?\s*/i, "")
+    .replace(/\s*```$/i, "");
 
   let parsed: unknown;
   try {
-    parsed = JSON.parse(jsonStr);
+    parsed = JSON.parse(cleaned);
   } catch {
-    return { action: "final_answer", answer: raw.trim().slice(0, 3000) };
+    // Si no parsea como JSON, lo tratamos como respuesta final en texto plano
+    return { action: "final_answer", answer: raw.trim() };
   }
 
   if (!parsed || typeof parsed !== "object") {
@@ -293,136 +271,15 @@ async function executeTool(toolName: string, args: Record<string, unknown>): Pro
 const MAX_TURNS = 4;
 
 /**
- * Elimina el bloque de razonamiento ("thinking") que Gemma 4 externaliza.
- *
- * Patrón observado: el modelo escribe bullet points con asterisco (`*   *texto*`)
- * para su cadena de pensamiento, y luego escribe la respuesta limpia como texto
- * normal o lista numerada. Por lo tanto, buscamos el último bloque continuo de
- * texto que NO contenga líneas de bullet asterisco — ese es la respuesta real.
- */
-function stripThinking(raw: string): string {
-  const lines = raw.split("\n");
-
-  // Detectar si hay thinking (líneas que empiezan con `*` seguido de espacio o más `*`)
-  const isThinkingLine = (line: string) => /^\s{0,4}\*(?:\s|\*)/.test(line);
-  const hasThinkin = lines.some(isThinkingLine);
-  if (!hasThinkin) return raw; // Sin thinking — devolver intacto
-
-  // Encontrar el índice de la última línea de thinking
-  let lastThinkingIdx = -1;
-  for (let i = lines.length - 1; i >= 0; i--) {
-    if (isThinkingLine(lines[i])) {
-      lastThinkingIdx = i;
-      break;
-    }
-  }
-
-  // Tomar todo lo que viene después de la última línea de thinking
-  const after = lines
-    .slice(lastThinkingIdx + 1)
-    .join("\n")
-    .trim();
-
-  // Solo usar si el resultado es sustancioso (más de 40 caracteres)
-  if (after.length > 40) return after;
-
-  // Fallback: buscar la sección que empieza con "El " / "Los " / "La " (artículo español)
-  // en la segunda mitad del texto — suele ser el inicio de la respuesta final
-  const spanishStart = raw.lastIndexOf("\n\nEl ");
-  if (spanishStart !== -1 && raw.length - spanishStart < raw.length * 0.6) {
-    return raw.slice(spanishStart).trim();
-  }
-
-  return raw; // Si todo falla, devolver original
-}
-
-/**
- * Llamada final separada: Gemma redacta la respuesta en texto libre (sin JSON).
- * Al no exigirle formato JSON, evitamos que meta razonamientos en el campo "answer".
- */
-async function finalizeAnswer(
-  userMessage: string,
-  toolResults: Array<{ tool: string; result: string }>,
-): Promise<string> {
-  const apiKey = process.env.GEMMA_API_KEY;
-  if (!apiKey) throw new GemmaServiceError("GEMMA_API_KEY no está configurada.", 503);
-  const model = process.env.GEMMA_MODEL?.trim() || DEFAULT_MODEL;
-
-  const datosRecopilados = toolResults
-    .map((r, i) => `--- Resultado ${i + 1} (${r.tool}) ---\n${r.result}`)
-    .join("\n\n");
-
-  const prompt =
-    `Eres Vigía Público, asistente de obras públicas del Perú (fuente: INFOBRAS, Contraloría).\n` +
-    `Pregunta del usuario: "${userMessage}"\n\n` +
-    `DATOS OBTENIDOS DE LA BASE DE DATOS:\n${datosRecopilados}\n\n` +
-    `INSTRUCCION: Escribe DIRECTAMENTE la respuesta en español para el usuario. ` +
-    `Empieza inmediatamente con el contenido (ej: "El contratista...", "Se encontraron...", etc.). ` +
-    `NO escribas razonamientos, notas internas, viñetas de análisis ni listas de verificación. ` +
-    `Solo el texto que el ciudadano verá. Máx. 6 resultados si hay muchos.`;
-
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 60_000);
-
-  try {
-    const response = await fetch(
-      `${GEMMA_ENDPOINT}/${encodeURIComponent(model)}:generateContent`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey },
-        body: JSON.stringify({
-          contents: [{ role: "user", parts: [{ text: prompt }] }],
-          generationConfig: { temperature: 0.2, maxOutputTokens: 900 },
-          // Nota: thinkingConfig (budget:0) es solo para Gemini, NO para Gemma — no incluir.
-        }),
-        signal: controller.signal,
-      },
-    );
-
-    if (!response.ok) {
-      const body = await response.text().catch(() => "");
-      console.error(`Gemma finalizeAnswer HTTP ${response.status}:`, body.slice(0, 200));
-      throw new GemmaServiceError(
-        `Gemma no pudo redactar la respuesta (HTTP ${response.status}).`,
-        502,
-      );
-    }
-
-    const result = (await response.json()) as GemmaRawResponse;
-    const rawText = result.candidates?.[0]?.content?.parts
-      ?.map((p) => p.text ?? "")
-      .join("")
-      .trim();
-
-    if (!rawText) return "No pude redactar una respuesta con los datos disponibles.";
-
-    // Eliminar el bloque de thinking si el modelo lo externalizó de todas formas
-    return stripThinking(rawText);
-  } catch (error) {
-    if (error instanceof GemmaServiceError) throw error;
-    if (error instanceof Error && error.name === "AbortError") {
-      throw new GemmaServiceError("Gemma tardó demasiado. Inténtalo nuevamente.", 504);
-    }
-    throw new GemmaServiceError("No se pudo conectar con Gemma.");
-  } finally {
-    clearTimeout(timeout);
-  }
-}
-
-/**
  * Ejecuta el agente ReAct para responder una pregunta del usuario.
- * Fase 1: loop de tool-calling en JSON estricto (máx MAX_TURNS iteraciones).
- * Fase 2: llamada separada en texto libre para redactar la respuesta final.
  * @param userMessage — Texto libre del usuario
  * @returns Respuesta final en texto plano para enviar por Telegram
  */
 export async function runReactAgent(userMessage: string): Promise<string> {
+  // Historial de mensajes para el contexto multi-turn
   const messages: Array<{ role: "user" | "model"; text: string }> = [
     { role: "user", text: userMessage },
   ];
-
-  // Acumulamos todos los resultados de herramientas para la fase final
-  const toolResults: Array<{ tool: string; result: string }> = [];
 
   for (let turn = 0; turn < MAX_TURNS; turn++) {
     const rawResponse = await callGemma(messages);
@@ -431,37 +288,25 @@ export async function runReactAgent(userMessage: string): Promise<string> {
     try {
       step = parseAgentStep(rawResponse);
     } catch {
-      // Si no se puede parsear el JSON de planificación, intentar como respuesta final
-      if (toolResults.length > 0) break; // tenemos datos, ir a la fase final
-      return rawResponse.slice(0, 3500);
+      // Si no podemos parsear, devolvemos lo que dijo Gemma como texto
+      return rawResponse.slice(0, 4000);
     }
 
     if (step.action === "final_answer") {
-      // Gemma dice que tiene la respuesta — si ya tenemos datos de herramientas,
-      // usamos la fase final limpia; si no, devolvemos lo que dijo.
-      if (toolResults.length > 0) break;
       return step.answer;
     }
 
-    // Es un tool_call — ejecutar y acumular resultado
+    // Es un tool_call — ejecutar la herramienta y agregar resultado al historial
     const toolResult = await executeTool(step.tool, step.args);
-    toolResults.push({ tool: step.tool, result: toolResult });
 
-    // Agregar al historial para el próximo turno
+    // Apendemos el paso del modelo y el resultado de la herramienta como mensajes
     messages.push({ role: "model", text: rawResponse });
     messages.push({
       role: "user",
-      text:
-        `RESULTADO DE HERRAMIENTA (${step.tool}):\n${toolResult}\n\n` +
-        `Si necesitas otra herramienta, indícala en formato JSON tool_call. ` +
-        `Si ya tienes suficientes datos, responde: {"action":"final_answer","answer":"listo"}`,
+      text: `RESULTADO DE HERRAMIENTA (${step.tool}):\n${toolResult}\n\nAhora redacta la respuesta final para el usuario en formato "final_answer".`,
     });
   }
 
-  // ── Fase 2: redacción final en texto libre ──
-  if (toolResults.length === 0) {
-    return "No encontré datos relevantes para responder tu consulta. Intenta ser más específico.";
-  }
-
-  return finalizeAnswer(userMessage, toolResults);
+  // Si agotamos los turnos sin respuesta final
+  return "No pude completar la consulta en el tiempo permitido. Intenta reformular tu pregunta o sé más específico.";
 }

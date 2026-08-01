@@ -2,7 +2,7 @@ import type { Obra, ResultadoAnalisis } from "@/types/obra";
 import type { DatasetObra } from "@/types/dataset-obra";
 
 const GEMMA_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models";
-const DEFAULT_MODEL = "gemma-4-26b-a4b-it";
+const DEFAULT_MODEL = "gemma-4-E4B-it";
 
 interface GemmaResponse {
   candidates?: Array<{

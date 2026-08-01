@@ -10,17 +10,8 @@ function getPool(): Pool {
         "BD_POSTGRES no está configurada en .env. Agrega la connection string de Neon.",
       );
     }
-
-    // Quitamos sslmode y channel_binding de la URL para evitar el warning de deprecación
-    // de pg-connection-string v8 (estos parámetros se manejan vía la opción `ssl` del Pool).
-    const cleanedUrl = connectionString
-      .replace(/[?&]sslmode=[^&]*/g, "")
-      .replace(/[?&]channel_binding=[^&]*/g, "")
-      // Limpiar ? o & huérfanos que queden al final
-      .replace(/[?&]+$/, "");
-
     pool = new Pool({
-      connectionString: cleanedUrl,
+      connectionString,
       ssl: { rejectUnauthorized: false },
       max: 5,
       idleTimeoutMillis: 30_000,
