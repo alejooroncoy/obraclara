@@ -106,8 +106,15 @@ const DEFAULT_MODEL = "gemma-4-26b-a4b-it";
 
 interface GemmaRawResponse {
   candidates?: Array<{
-    content?: { parts?: Array<{ text?: string }> };
+    content?: { parts?: Array<{ text?: string; thought?: boolean }> };
+    finishReason?: string;
   }>;
+  usageMetadata?: {
+    promptTokenCount: number;
+    candidatesTokenCount: number;
+    totalTokenCount: number;
+    thoughtsTokenCount?: number;
+  };
 }
 
 async function callGemma(messages: Array<{ role: "user" | "model"; text: string }>): Promise<string> {
@@ -142,7 +149,10 @@ async function callGemma(messages: Array<{ role: "user" | "model"; text: string 
         },
         body: JSON.stringify({
           contents,
-          generationConfig: { temperature: 0.1, maxOutputTokens: 1024 },
+          generationConfig: {
+            temperature: 0.1,
+            maxOutputTokens: 3072,
+          },
         }),
         signal: controller.signal,
       },
@@ -159,8 +169,21 @@ async function callGemma(messages: Array<{ role: "user" | "model"; text: string 
     }
 
     const result = (await response.json()) as GemmaRawResponse;
-    const text = result.candidates?.[0]?.content?.parts
-      ?.map((p) => p.text ?? "")
+    const candidate = result.candidates?.[0];
+    const finishReason = candidate?.finishReason;
+    const thoughtsTokenCount = result.usageMetadata?.thoughtsTokenCount ?? 0;
+
+    if (finishReason === "MAX_TOKENS") {
+      console.warn(`[Gemma Agent Warning] Generación cortada por límite de tokens (MAX_TOKENS). Tokens de pensamiento generados: ${thoughtsTokenCount}`);
+      throw new GemmaServiceError(
+        `El agente no pudo completar la respuesta debido a un límite de tokens (MAX_TOKENS). Tokens de pensamiento generados: ${thoughtsTokenCount}`,
+        502,
+      );
+    }
+
+    const text = candidate?.content?.parts
+      ?.filter((p) => !p.thought)
+      .map((p) => p.text ?? "")
       .join("")
       .trim();
 

@@ -407,6 +407,15 @@ export async function obtener_historial_contratista(args: {
 
   const { score, etiqueta } = calcularScoreConfianza(total, finalizadas, paralizadas);
 
+  const MAX_OBRAS_RETORNADAS = 15;
+  const obrasCompletas = rows.map((r) => ({
+    codigo_infobras: r.codigo_infobras,
+    nombre: r.nombre_de_obra,
+    estado: r.estado_de_ejecucion,
+    monto_contrato: r.monto_del_contrato_en_soles,
+    avance_ejecutado: r.avance_fisico_real_acumulado_porcentaje,
+  }));
+
   return {
     contratista: args.contratista,
     total_obras: total,
@@ -415,12 +424,7 @@ export async function obtener_historial_contratista(args: {
     paralizadas,
     score_confianza: score,
     etiqueta_confianza: etiqueta,
-    obras: rows.map((r) => ({
-      codigo_infobras: r.codigo_infobras,
-      nombre: r.nombre_de_obra,
-      estado: r.estado_de_ejecucion,
-      monto_contrato: r.monto_del_contrato_en_soles,
-      avance_ejecutado: r.avance_fisico_real_acumulado_porcentaje,
-    })),
+    obras_truncadas: total > MAX_OBRAS_RETORNADAS,
+    obras: obrasCompletas.slice(0, MAX_OBRAS_RETORNADAS),
   };
 }

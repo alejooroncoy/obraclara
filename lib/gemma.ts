@@ -2,12 +2,19 @@ import type { Obra, ResultadoAnalisis } from "@/types/obra";
 import type { DatasetObra } from "@/types/dataset-obra";
 
 const GEMMA_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models";
-const DEFAULT_MODEL = "gemma-4-E4B-it";
+const DEFAULT_MODEL = "gemma-4-26b-a4b-it";
 
 interface GemmaResponse {
   candidates?: Array<{
-    content?: { parts?: Array<{ text?: string }> };
+    content?: { parts?: Array<{ text?: string; thought?: boolean }> };
+    finishReason?: string;
   }>;
+  usageMetadata?: {
+    promptTokenCount: number;
+    candidatesTokenCount: number;
+    totalTokenCount: number;
+    thoughtsTokenCount?: number;
+  };
 }
 
 export class GemmaServiceError extends Error {
@@ -78,7 +85,10 @@ async function generateWithGemma(prompt: string): Promise<{ output: string; mode
       },
       body: JSON.stringify({
         contents: [{ role: "user", parts: [{ text: prompt }] }],
-        generationConfig: { temperature: 0.2 },
+        generationConfig: {
+          temperature: 0.2,
+          maxOutputTokens: 3072,
+        },
       }),
       signal: controller.signal,
     });
@@ -95,10 +105,24 @@ async function generateWithGemma(prompt: string): Promise<{ output: string; mode
     }
 
     const result = (await response.json()) as GemmaResponse;
-    const output = result.candidates?.[0]?.content?.parts
-      ?.map((part) => part.text ?? "")
+    const candidate = result.candidates?.[0];
+    const finishReason = candidate?.finishReason;
+    const thoughtsTokenCount = result.usageMetadata?.thoughtsTokenCount ?? 0;
+
+    if (finishReason === "MAX_TOKENS") {
+      console.warn(`[Gemma Warning] Generación cortada por límite de tokens (MAX_TOKENS). Tokens de pensamiento generados: ${thoughtsTokenCount}`);
+      throw new GemmaServiceError(
+        `Gemma no pudo completar la respuesta debido a un límite de tokens (MAX_TOKENS). Tokens de pensamiento generados: ${thoughtsTokenCount}`,
+        502,
+      );
+    }
+
+    const output = candidate?.content?.parts
+      ?.filter((part) => !part.thought)
+      .map((part) => part.text ?? "")
       .join("")
       .trim();
+
     if (!output) throw new GemmaServiceError("Gemma no devolvió contenido para analizar.");
 
     return { output, model };
