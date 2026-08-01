@@ -1,5 +1,6 @@
 import { loadEnvConfig } from "@next/env";
-import { Bot, InlineKeyboard, Keyboard } from "grammy";
+import { Bot, Context, InlineKeyboard, Keyboard } from "grammy";
+import { closePool } from "../lib/db";
 import { loadDatasetObras } from "../lib/dataset-obras";
 import { formatCurrency } from "../lib/formatters";
 import {
@@ -7,6 +8,7 @@ import {
   datasetObraComoTexto,
   responderPreguntaConGemma,
 } from "../lib/gemma";
+import { runReactAgent } from "../lib/agent/react-agent";
 import { findNearbyObras } from "../lib/nearby-obras";
 
 loadEnvConfig(process.cwd());
@@ -33,11 +35,31 @@ async function main() {
     selectedByChat.delete(ctx.chat.id);
     await ctx.reply(
       "¡Hola! Soy Vigía Público, el bot de ObraClara.\n\n" +
-        "Las obras provienen del archivo INFOBRAS data/dataset.xlsx. Comparte tu ubicación para consultar las tres más cercanas.\n\n" +
-        "⚠️ El Excel no incluye coordenadas; la cercanía es una simulación referencial. Gemma analiza los campos del Excel y no busca datos externos.",
+        "📍 Comparte tu ubicación para ver las 3 obras más cercanas de INFOBRAS.\n" +
+        "💬 O escribe directamente tu consulta sobre cualquier obra pública del Perú (uso el agente inteligente con datos reales de Postgres).\n\n" +
+        "Comandos:\n" +
+        "/consulta — Activa el modo agente libre\n" +
+        "/start — Reinicia y vuelve al menú principal\n\n" +
+        "⚠️ Las distancias por ubicación son simuladas (el dataset no incluye coordenadas reales).",
       { reply_markup: locationKeyboard },
     );
   });
+
+  // Comando /consulta y alias /agente — activa el modo agente sin necesidad de ubicación
+  const handleConsulta = async (ctx: Context) => {
+    if (ctx.chat) selectedByChat.delete(ctx.chat.id);
+    await ctx.reply(
+      "🤖 Modo agente activado. Escribe tu consulta sobre obras públicas del Perú y Gemma buscará en la BD de INFOBRAS.\n\n" +
+        "Ejemplos:\n" +
+        "• ¿Qué obras tiene el contratista AESA en Lima?\n" +
+        "• Muéstrame obras paralizadas en Cusco\n" +
+        "• Dame el detalle del código INFOBRAS 12345\n" +
+        "• Busca obras en Av. Arequipa Miraflores",
+      { reply_markup: { remove_keyboard: true } },
+    );
+  };
+  bot.command("consulta", handleConsulta);
+  bot.command("agente", handleConsulta);
 
   bot.on("message:location", async (ctx) => {
     try {
@@ -119,30 +141,60 @@ async function main() {
   });
 
   bot.on("message:text", async (ctx) => {
-    const index = selectedByChat.get(ctx.chat.id);
-    if (index === undefined) {
-      await ctx.reply("Usa /start, comparte tu ubicación y selecciona una obra antes de preguntar.", {
-        reply_markup: locationKeyboard,
-      });
-      return;
-    }
-    if (ctx.message.text.length > 500) {
-      await ctx.reply("La pregunta es demasiado larga. Usa un máximo de 500 caracteres.");
+    const text = ctx.message.text.trim();
+
+    // Ignorar comandos (ya los maneja grammy aparte)
+    if (text.startsWith("/")) return;
+
+    if (text.length > 800) {
+      await ctx.reply("La consulta es demasiado larga. Usa un máximo de 800 caracteres.");
       return;
     }
 
+    const index = selectedByChat.get(ctx.chat.id);
+
+    // ── Flujo A: hay una obra seleccionada → preguntas específicas sobre esa obra ──
+    if (index !== undefined) {
+      if (text.length > 500) {
+        await ctx.reply("La pregunta es demasiado larga. Usa un máximo de 500 caracteres.");
+        return;
+      }
+      try {
+        await ctx.reply("Gemma está revisando esa pregunta en los datos del Excel…");
+        const obra = obras[index];
+        const answer = await responderPreguntaConGemma(
+          datasetObraComoTexto(obra),
+          text,
+        );
+        await ctx.reply(`${answer}\n\nFuente: ${obra.fuente}.`);
+      } catch (error) {
+        console.error("Gemma no pudo responder una pregunta sobre la obra.");
+        await ctx.reply(
+          error instanceof Error ? `No pude responder: ${error.message}` : "No pude responder la pregunta.",
+        );
+      }
+      return;
+    }
+
+    // ── Flujo B: sin obra seleccionada → agente ReAct con BD Postgres ──
     try {
-      await ctx.reply("Gemma está revisando esa pregunta en los datos del Excel…");
-      const obra = obras[index];
-      const answer = await responderPreguntaConGemma(
-        datasetObraComoTexto(obra),
-        ctx.message.text,
-      );
-      await ctx.reply(`${answer}\n\nFuente: ${obra.fuente}.`);
+      await ctx.reply("🔍 Consultando la base de datos de INFOBRAS…");
+      const respuesta = await runReactAgent(text);
+      // Telegram limita mensajes a 4096 caracteres
+      if (respuesta.length <= 4096) {
+        await ctx.reply(respuesta);
+      } else {
+        // Partir en fragmentos si la respuesta es muy larga
+        for (let i = 0; i < respuesta.length; i += 4000) {
+          await ctx.reply(respuesta.slice(i, i + 4000));
+        }
+      }
     } catch (error) {
-      console.error("Gemma no pudo responder una pregunta sobre la obra.");
+      console.error("El agente ReAct falló:", error);
       await ctx.reply(
-        error instanceof Error ? `No pude responder: ${error.message}` : "No pude responder la pregunta.",
+        error instanceof Error
+          ? `No pude completar la consulta: ${error.message}`
+          : "Ocurrió un error al procesar tu consulta. Inténtalo nuevamente.",
       );
     }
   });
@@ -156,10 +208,14 @@ async function main() {
     }
   });
 
-  process.once("SIGINT", () => bot.stop());
-  process.once("SIGTERM", () => bot.stop());
+  const shutdown = async () => {
+    bot.stop();
+    await closePool();
+  };
+  process.once("SIGINT", () => { void shutdown(); });
+  process.once("SIGTERM", () => { void shutdown(); });
   console.log("Vigía Público está iniciando por long polling.");
-  await bot.start({ onStart: () => console.log("Vigía Público está listo.") });
+  await bot.start({ onStart: () => console.log("Vigía Público está listo. Agente ReAct activo.") });
 }
 
 main().catch((error) => {
