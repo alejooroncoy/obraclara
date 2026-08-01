@@ -6,3 +6,4 @@ SQLAlchemy==2.0.20
 psycopg2-binary==2.9.7
 numpy<2.0
 unidecode
+python-dotenv
